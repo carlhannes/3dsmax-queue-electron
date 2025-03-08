@@ -27,7 +27,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const selectMaxPathBtn = document.getElementById('select-max-path-btn');
   const saveSettingsBtn = document.getElementById('save-settings-btn');
 
-  // Add a message to the console output
+  // Add a message to the console output with improved encoding handling
   function addConsoleMessage(message, type = 'info') {
     console.log(`Console message (${type}):`, message);
     const messageElement = document.createElement('div');
@@ -41,7 +41,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (type === 'success') className = 'text-success';
     
     messageElement.className = className;
-    messageElement.textContent = `[${timestamp}] ${message}`;
+    
+    // Create text node instead of using textContent to ensure proper rendering
+    const textNode = document.createTextNode(`[${timestamp}] ${message}`);
+    messageElement.appendChild(textNode);
     
     consoleOutput.appendChild(messageElement);
     consoleOutput.scrollTop = consoleOutput.scrollHeight;
@@ -399,19 +402,23 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Set up event listeners for render output
+  // Set up event listeners for render output with improved encoding handling
   console.log('Setting up render output event listeners');
   
   // Register the event handler for render output
   window.api.onRenderOutput((data) => {
     // Find the file with the matching process ID
     const file = renderQueue.find(f => f.processId === data.id);
+    const fileName = file ? file.name : 'Unknown';
+    
+    // Decode and clean output if needed
+    let outputText = data.output;
     
     // Add the output to the console
     if (data.error) {
-      addConsoleMessage(`[${file ? file.name : 'Unknown'}] ${data.output}`, 'error');
+      addConsoleMessage(`[${fileName}] ${outputText}`, 'error');
     } else {
-      addConsoleMessage(`[${file ? file.name : 'Unknown'}] ${data.output}`);
+      addConsoleMessage(`[${fileName}] ${outputText}`);
     }
     
     // Check if the render has completed

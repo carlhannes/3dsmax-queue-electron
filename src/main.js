@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process'; // Add spawn import
 import { promisify } from 'util';
 import Store from 'electron-store';
 import os from 'os';
@@ -62,16 +62,11 @@ async function detect3dsMaxPath() {
   let maxPath = store.get('maxPath');
   
   if (!maxPath) {
-    // Common installation directories for 3ds Max on Windows
     const programFiles = process.env['ProgramFiles'];
     const programFilesX86 = process.env['ProgramFiles(x86)'];
     
-    const possiblePaths = [
-      programFiles,
-      programFilesX86
-    ].filter(Boolean);
+    const possiblePaths = [programFiles, programFilesX86].filter(Boolean);
     
-    // Check for Autodesk directories
     for (const basePath of possiblePaths) {
       const autodeskPath = path.join(basePath, 'Autodesk');
       
@@ -100,134 +95,186 @@ async function detect3dsMaxPath() {
   return maxPath;
 }
 
-// Set up all IPC handlers
+// Set up IPC handlers
 function setupIpcHandlers() {
-  // Handle file drops and selections
   ipcMain.handle('select-files', async () => {
-    console.log('Select files dialog requested');
     try {
       const { canceled, filePaths } = await dialog.showOpenDialog({
         properties: ['openFile', 'multiSelections'],
-        filters: [
-          { name: '3ds Max Files', extensions: ['max'] }
-        ]
+        filters: [{ name: '3ds Max Files', extensions: ['max'] }]
       });
-      
-      console.log('Dialog result:', { canceled, filePaths });
-      if (!canceled) {
-        return filePaths;
-      }
-      return [];
+      return !canceled ? filePaths : [];
     } catch (error) {
-      console.error('Error showing file dialog:', error);
+      console.error('Error selecting files:', error);
       return [];
     }
   });
 
-  // Handle folder selection for output
   ipcMain.handle('select-output-folder', async () => {
-    console.log('Select output folder dialog requested');
     try {
       const { canceled, filePaths } = await dialog.showOpenDialog({
         properties: ['openDirectory'],
       });
-      
-      console.log('Dialog result:', { canceled, filePaths });
       if (!canceled && filePaths.length > 0) {
         store.set('outputFolder', filePaths[0]);
         return filePaths[0];
       }
       return store.get('outputFolder');
     } catch (error) {
-      console.error('Error showing folder dialog:', error);
+      console.error('Error selecting folder:', error);
       return store.get('outputFolder');
     }
   });
 
-  // Get settings from store
   ipcMain.handle('get-settings', async () => {
-    console.log('Settings requested from renderer');
-    const settings = {
+    return {
       outputFolder: store.get('outputFolder'),
       maxPath: await detect3dsMaxPath()
     };
-    console.log('Returning settings:', settings);
-    return settings;
   });
 
-  // Save settings to store
   ipcMain.handle('save-settings', async (event, settings) => {
-    console.log('Saving settings:', settings);
     store.set('outputFolder', settings.outputFolder);
-    if (settings.maxPath) {
-      store.set('maxPath', settings.maxPath);
-    }
+    if (settings.maxPath) store.set('maxPath', settings.maxPath);
     return true;
   });
 
-  // Render a single file
   ipcMain.handle('render-file', async (event, { file, outputName, projectName }) => {
     const maxPath = await detect3dsMaxPath();
-    if (!maxPath) {
-      throw new Error('3ds Max path not found. Please set it in the settings.');
-    }
-    
+    if (!maxPath) throw new Error('3ds Max path not found. Please set it in the settings.');
+
     const outputFolder = store.get('outputFolder');
     const projectFolder = projectName ? path.join(outputFolder, projectName) : outputFolder;
     
-    // Create output directory if it doesn't exist
     if (!fs.existsSync(projectFolder)) {
       fs.mkdirSync(projectFolder, { recursive: true });
     }
-    
-    // Build the output path - use file basename if outputName not provided
+
     const baseFileName = path.basename(file, '.max');
     const outputFileName = outputName || `${baseFileName}.jpg`;
     const outputPath = path.join(projectFolder, outputFileName);
 
-    // Prepare command line arguments
-    const args = [
-      file,
-      '-silent',
-      '-outputName:' + outputPath,
-      '-v:5' // Verbose output
-    ];
+    // Fix batch file syntax - escape properly and use correct CMD syntax
+    const sessionLogPath = path.join(projectFolder, `maxrender_log_${Date.now()}.txt`);
+    const batchFile = path.join(projectFolder, `max_render_${Date.now()}.bat`);
     
-    // Create a unique ID for this render process
+    // Create batch content with proper CMD syntax and line endings
+    const batchContent = `@echo off\r\n
+:: Set code page to UTF-8\r\n
+chcp 65001 > nul\r\n
+
+:: Set environment variables for optimal rendering\r\n
+set "ADSK_3DSMAX_BUFFEREDFILE_BUFFERSIZE=262144"\r\n
+set "ADSK_3DSMAX_SESSION_LOG=${sessionLogPath.replace(/\\/g, '\\\\')}"\r\n
+
+:: Execute 3ds Max
+"${maxPath}" "${file}" -outputName:"${outputPath}" -v:5 -stillFrame -gammaCorrection:1\r\n
+exit %ERRORLEVEL%`;
+    
+    // Write the batch file with Windows line endings
+    fs.writeFileSync(batchFile, batchContent.replace(/\r\n/g, '\r\n'), { encoding: 'utf8' });
+
     const processId = Date.now().toString();
     
     try {
-      // Start the render process
-      const process = execFile(maxPath, args);
+      // Execute the batch file with proper encoding
+      const process = spawn(batchFile, [], { 
+        encoding: 'utf8',
+        shell: true,
+        windowsVerbatimArguments: true
+      });
+      
       renderProcesses[processId] = process;
       
-      // Send output to the renderer
+      // Enhanced output handling with explicit UTF-8 encoding
       process.stdout.on('data', (data) => {
         if (mainWindow) {
-          mainWindow.webContents.send('render-output', { id: processId, output: data.toString() });
+          // Convert buffer to string with explicit UTF-8 encoding and normalize text
+          const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+          const output = buffer.toString('utf8').trim();
+          
+          if (output) { // Only send non-empty output
+            // Replace any problematic characters
+            const cleanOutput = output
+              .replace(/\uFFFD/g, '?') // Replace replacement character with question mark
+              .replace(/[^\x20-\x7E\u00A0-\u00FF\u0100-\u017F\u0180-\u024F\u2022\u2013\u2014\u2018\u2019\u201C\u201D\u2026\u2032\u2033]/g, '·'); // Replace other unusual chars with dots
+              
+            mainWindow.webContents.send('render-output', { id: processId, output: cleanOutput });
+          }
         }
       });
       
       process.stderr.on('data', (data) => {
         if (mainWindow) {
-          mainWindow.webContents.send('render-output', { id: processId, output: data.toString(), error: true });
+          // Same encoding handling for stderr
+          const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+          const output = buffer.toString('utf8').trim();
+          
+          if (output) {
+            // Replace any problematic characters
+            const cleanOutput = output
+              .replace(/\uFFFD/g, '?')
+              .replace(/[^\x20-\x7E\u00A0-\u00FF\u0100-\u017F\u0180-\u024F\u2022\u2013\u2014\u2018\u2019\u201C\u201D\u2026\u2032\u2033]/g, '·');
+              
+            mainWindow.webContents.send('render-output', { id: processId, output: cleanOutput, error: true });
+          }
         }
       });
-      
-      // Return the process ID to track this render job
+
+      // Add completion handling
+      process.on('exit', (code) => {
+        // Check if session log exists and read it for additional info
+        try {
+          if (fs.existsSync(sessionLogPath)) {
+            const logContent = fs.readFileSync(sessionLogPath, 'utf8');
+            if (logContent && mainWindow) {
+              mainWindow.webContents.send('render-output', { 
+                id: processId, 
+                output: 'Session log: ' + logContent
+              });
+            }
+            // Clean up session log
+            //fs.unlinkSync(sessionLogPath);
+          }
+        } catch (err) {
+          console.error('Error processing session log:', err);
+        }
+
+        // Clean up the batch file
+        try {
+          //fs.unlinkSync(batchFile);
+        } catch (err) {
+          console.error('Error cleaning up batch file:', err);
+        }
+        
+        // Send completion message based on exit code
+        if (mainWindow) {
+          const status = code === 0 ? 'Rendering completed successfully' : `Rendering process exited with code ${code}`;
+          mainWindow.webContents.send('render-output', { 
+            id: processId, 
+            output: status,
+            error: code !== 0
+          });
+        }
+      });
+
       return { id: processId, file, outputPath };
     } catch (error) {
       console.error('Error starting render:', error);
+      // Clean up the batch file if there's an error
+      try {
+        fs.unlinkSync(batchFile);
+      } catch (err) {
+        console.error('Error cleaning up batch file after error:', err);
+      }
       throw error;
     }
   });
 
-  // Get all current render processes
   ipcMain.handle('get-render-processes', () => {
     return Object.keys(renderProcesses).map(id => ({ id }));
   });
 
-  // Cancel a render process
   ipcMain.handle('cancel-render', (event, id) => {
     if (renderProcesses[id]) {
       renderProcesses[id].kill();
@@ -237,11 +284,8 @@ function setupIpcHandlers() {
     return false;
   });
 
-  // Open the output folder
   ipcMain.handle('open-output-folder', async (event, customPath) => {
-    console.log('Opening output folder');
     const folderPath = customPath || store.get('outputFolder');
-    console.log('Folder path:', folderPath);
     if (folderPath) {
       try {
         await shell.openPath(folderPath);
@@ -258,13 +302,8 @@ function setupIpcHandlers() {
 // Initialize application
 async function init() {
   try {
-    // Set up all IPC handlers
     setupIpcHandlers();
-    
-    // Create the main window
     await createWindow();
-    
-    // Detect 3ds Max path
     const maxPath = await detect3dsMaxPath();
     console.log('3ds Max path detected:', maxPath || 'Not found');
   } catch (error) {
@@ -276,21 +315,13 @@ async function init() {
 app.whenReady().then(init);
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
-  }
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
-// Clean up before quitting
 app.on('before-quit', () => {
-  // Kill any running render processes
-  Object.values(renderProcesses).forEach(process => {
-    process.kill();
-  });
+  Object.values(renderProcesses).forEach(process => process.kill());
 });
